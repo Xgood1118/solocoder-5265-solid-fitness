@@ -15,16 +15,17 @@ impl PrService {
             SELECT
                 ws.exercise_id,
                 e.name as exercise_name,
-                MAX(CASE WHEN ws.with_assistance = 0 THEN ws.weight ELSE 0 END) as max_weight,
-                MAX(CASE WHEN ws.with_assistance = 0 THEN ws.reps ELSE 0 END) as max_reps,
+                ws.weight as max_weight,
+                ws.reps as max_reps,
                 ws.id as max_volume_set_id,
-                MAX(ws.created_at) as achieved_at
+                ws.created_at as achieved_at
             FROM workout_sets ws
             JOIN exercises e ON e.id = ws.exercise_id
             WHERE ws.exercise_id = ?
                 AND ws.completed = 1
                 AND ws.with_assistance = 0
-            GROUP BY ws.exercise_id
+            ORDER BY ws.weight DESC, ws.reps DESC, ws.created_at DESC
+            LIMIT 1
             "#
         )
         .bind(exercise_id)
@@ -35,27 +36,21 @@ impl PrService {
     }
 
     pub async fn get_all_prs(pool: &SqlitePool) -> Result<Vec<PrRecord>> {
-        let records = sqlx::query_as::<_, PrRecord>(
-            r#"
-            SELECT
-                ws.exercise_id,
-                e.name as exercise_name,
-                MAX(ws.weight) as max_weight,
-                MAX(ws.reps) as max_reps,
-                ws.id as max_volume_set_id,
-                MAX(ws.created_at) as achieved_at
-            FROM workout_sets ws
-            JOIN exercises e ON e.id = ws.exercise_id
-            WHERE ws.completed = 1
-                AND ws.with_assistance = 0
-            GROUP BY ws.exercise_id
-            ORDER BY max_weight DESC
-            "#
+        let exercises: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT exercise_id FROM workout_sets WHERE completed = 1 AND with_assistance = 0"
         )
         .fetch_all(pool)
         .await?;
 
-        Ok(records)
+        let mut prs = Vec::new();
+        for (exercise_id,) in exercises {
+            if let Some(pr) = Self::calculate_exercise_pr(pool, exercise_id).await? {
+                prs.push(pr);
+            }
+        }
+
+        prs.sort_by(|a, b| b.max_weight.partial_cmp(&a.max_weight).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(prs)
     }
 
     pub async fn check_if_new_pr(
@@ -65,17 +60,19 @@ impl PrService {
         reps: i32,
         with_assistance: bool,
     ) -> Result<bool> {
-        if with_assistance {
+        if with_assistance || weight <= 0.0 {
             return Ok(false);
         }
 
         let current_pr: Option<(f64, i32)> = sqlx::query_as(
             r#"
-            SELECT MAX(weight) as max_weight, MAX(reps) as max_reps
+            SELECT weight, reps
             FROM workout_sets
             WHERE exercise_id = ?
                 AND completed = 1
                 AND with_assistance = 0
+            ORDER BY weight DESC, reps DESC
+            LIMIT 1
             "#
         )
         .bind(exercise_id)
@@ -83,16 +80,16 @@ impl PrService {
         .await?;
 
         match current_pr {
-            Some((max_weight, max_reps)) => {
-                if weight > max_weight {
+            Some((best_weight, best_reps)) => {
+                if weight > best_weight {
                     return Ok(true);
                 }
-                if (weight - max_weight).abs() < f64::EPSILON && reps > max_reps {
+                if (weight - best_weight).abs() < f64::EPSILON && reps > best_reps {
                     return Ok(true);
                 }
                 Ok(false)
             }
-            None => Ok(weight > 0.0),
+            None => Ok(true),
         }
     }
 }
@@ -229,7 +226,7 @@ impl CalendarService {
         muscles: &[String],
         target_date: NaiveDate,
     ) -> Result<Vec<MuscleConflict>> {
-        let three_days_ago = target_date - Duration::days(3);
+        let two_days_ago = target_date - Duration::days(2);
         let mut conflicts = Vec::new();
 
         for muscle in muscles {
@@ -243,19 +240,19 @@ impl CalendarService {
                 JOIN exercises e ON e.id = wset.exercise_id
                 WHERE e.primary_muscle = ?
                     AND ws.session_date >= ?
-                    AND ws.session_date < ?
+                    AND ws.session_date <= ?
                 "#
             )
             .bind(target_date.format("%Y-%m-%d").to_string())
             .bind(muscle)
-            .bind(three_days_ago.format("%Y-%m-%d").to_string())
+            .bind(two_days_ago.format("%Y-%m-%d").to_string())
             .bind(target_date.format("%Y-%m-%d").to_string())
             .fetch_optional(pool)
             .await?;
 
             if let Some((last_date_opt, days_since_opt)) = result {
                 if let Some(last_date_str) = last_date_opt {
-                    let days_since = days_since_opt.unwrap_or(999);
+                    let days_since = days_since_opt.unwrap_or(0);
                     conflicts.push(MuscleConflict {
                         muscle: muscle.clone(),
                         last_train_date: last_date_str,
@@ -265,7 +262,7 @@ impl CalendarService {
                 } else {
                     conflicts.push(MuscleConflict {
                         muscle: muscle.clone(),
-                        last_train_date: three_days_ago.format("%Y-%m-%d").to_string(),
+                        last_train_date: "".to_string(),
                         days_since: 999,
                         conflict: false,
                     });

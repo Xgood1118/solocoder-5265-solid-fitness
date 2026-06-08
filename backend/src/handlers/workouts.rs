@@ -130,26 +130,15 @@ pub async fn create_session(
     let mut total_volume: f64 = 0.0;
 
     for set in &payload.sets {
-        let is_pr = PrService::check_if_new_pr(
-            &pool,
-            set.exercise_id,
-            set.weight,
-            set.reps,
-            set.with_assistance.unwrap_or(false),
-        )
-        .await
-        .unwrap_or(false);
-
         let completed = set.completed.unwrap_or(true) as i64;
         let with_assistance = set.with_assistance.unwrap_or(false) as i64;
-        let is_pr_i = is_pr as i64;
 
         sqlx::query(
             r#"
             INSERT INTO workout_sets
                 (session_id, exercise_id, set_number, weight, reps,
                  completed, is_pr, with_assistance, notes, rest_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             "#
         )
         .bind(session_id)
@@ -158,7 +147,6 @@ pub async fn create_session(
         .bind(set.weight)
         .bind(set.reps)
         .bind(completed)
-        .bind(is_pr_i)
         .bind(with_assistance)
         .bind(&set.notes)
         .bind(set.rest_seconds)
@@ -171,6 +159,53 @@ pub async fn create_session(
 
         if set.completed.unwrap_or(true) {
             total_volume += set.weight * set.reps as f64;
+        }
+    }
+
+    let exercise_bests: Vec<(i64, i64, f64, i32, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            id, exercise_id, weight, reps, with_assistance
+        FROM workout_sets
+        WHERE session_id = ?
+          AND completed = 1
+        ORDER BY exercise_id, weight DESC, reps DESC
+        "#
+    )
+    .bind(session_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to get session sets for PR calc: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut last_exercise_id: Option<i64> = None;
+    for (set_id, exercise_id, weight, reps, with_assistance) in exercise_bests {
+        if Some(exercise_id) == last_exercise_id {
+            continue;
+        }
+        last_exercise_id = Some(exercise_id);
+
+        let is_pr = PrService::check_if_new_pr(
+            &pool,
+            exercise_id,
+            weight,
+            reps,
+            with_assistance == 1,
+        )
+        .await
+        .unwrap_or(false);
+
+        if is_pr {
+            sqlx::query("UPDATE workout_sets SET is_pr = 1 WHERE id = ?")
+                .bind(set_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to update PR flag: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
     }
 
