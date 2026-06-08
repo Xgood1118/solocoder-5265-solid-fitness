@@ -64,31 +64,24 @@ impl PrService {
             return Ok(false);
         }
 
-        let current_pr: Option<(f64, i32)> = sqlx::query_as(
+        let current_best_reps: Option<i32> = sqlx::query_as(
             r#"
-            SELECT weight, reps
+            SELECT MAX(reps)
             FROM workout_sets
             WHERE exercise_id = ?
                 AND completed = 1
                 AND with_assistance = 0
-            ORDER BY weight DESC, reps DESC
-            LIMIT 1
+                AND weight = ?
             "#
         )
         .bind(exercise_id)
+        .bind(weight)
         .fetch_optional(pool)
-        .await?;
+        .await?
+        .map(|(r,)| r);
 
-        match current_pr {
-            Some((best_weight, best_reps)) => {
-                if weight > best_weight {
-                    return Ok(true);
-                }
-                if (weight - best_weight).abs() < f64::EPSILON && reps > best_reps {
-                    return Ok(true);
-                }
-                Ok(false)
-            }
+        match current_best_reps {
+            Some(best_reps) => Ok(reps > best_reps),
             None => Ok(true),
         }
     }

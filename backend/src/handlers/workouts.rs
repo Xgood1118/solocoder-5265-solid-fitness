@@ -162,7 +162,7 @@ pub async fn create_session(
         }
     }
 
-    let exercise_bests: Vec<(i64, i64, f64, i32, i64)> = sqlx::query_as(
+    let session_sets: Vec<(i64, i64, f64, i32, i64)> = sqlx::query_as(
         r#"
         SELECT
             id, exercise_id, weight, reps, with_assistance
@@ -180,12 +180,17 @@ pub async fn create_session(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut last_exercise_id: Option<i64> = None;
-    for (set_id, exercise_id, weight, reps, with_assistance) in exercise_bests {
-        if Some(exercise_id) == last_exercise_id {
+    fn weight_key(w: f64) -> i64 {
+        (w * 100.0).round() as i64
+    }
+
+    let mut last_key: Option<(i64, i64)> = None;
+    for (set_id, exercise_id, weight, reps, with_assistance) in session_sets {
+        let key = (exercise_id, weight_key(weight));
+        if Some(key) == last_key {
             continue;
         }
-        last_exercise_id = Some(exercise_id);
+        last_key = Some(key);
 
         let is_pr = PrService::check_if_new_pr(
             &pool,
