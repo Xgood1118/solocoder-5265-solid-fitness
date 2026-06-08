@@ -64,3 +64,12 @@ logs/
 .env
 .env.local
 *.local
+
+# Database (SQLite)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Test screenshots (SoloCoder reviewer-generated, not part of project)
+screenshot_R*.png

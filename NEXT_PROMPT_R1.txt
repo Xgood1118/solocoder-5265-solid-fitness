@@ -1,0 +1,72 @@
+R1 反馈（5265-solid-fitness）— PR is_pr 标记 bug + 肌群冲突 SQL 边界 bug
+
+核心问题：PR 校验的 `is_pr` 字段在「同重量多组」场景下被全部错误标记为 true，违反了 PROMPT 明确要求的「PR 校验要做"是否真正突破"校验：同重量多组不重复计数、助力带完成的不算」。
+
+---
+
+## Bug #1（高优先级，PROMPT 显性需求违反）：PR is_pr 标记 bug
+
+**复现步骤**：
+1. 创建 session，包含 3 组杠铃卧推（60kg × 8 reps）+ 1 组俯卧挺身（50kg × 12 reps）
+2. POST /api/workouts 提交
+3. 查看返回的 sets 数组
+4. **期望**：第 1 组是 PR（is_pr=1），第 2/3 组同重量同次数应该都不是 PR（is_pr=0）
+5. **实际**：第 1/2/3 组全部 is_pr=1（实测 response：`is_pr: 1` × 3 连续）
+
+**根因**（定位在 `backend/src/handlers/workouts.rs` 的 `create_session`）：
+```rust
+let mut tx = pool.begin().await...?;  // ← 事务 tx
+for set in &payload.sets {
+    let is_pr = PrService::check_if_new_pr(&pool, ...).await...?;  // ← 用了 &pool 而非 &mut *tx
+    ...
+    sqlx::query(...).execute(&mut *tx).await...?;  // ← 插入进 tx 但未提交
+}
+```
+
+`PrService::check_if_new_pr` 通过 `&pool` 查询现有 workout_sets，但前几组的 INSERT 还在事务 tx 里没提交，pool 看不到。所以第 1/2/3/4 组的检查永远看到空表（None 分支 → `weight > 0.0` → true），全部被打成 PR。
+
+**修复方向**：
+- 选项 A：把 `check_if_new_pr` 改成接受 `&mut Transaction` 而不是 `&SqlitePool`
+- 选项 B：每组 INSERT 后立即 commit（破坏事务原子性，不推荐）
+- 选项 C：循环结束后 commit 前重新计算每组的 is_pr（在事务内做一遍 SELECT 然后 UPDATE）
+
+**期望效果**：3 组 60kg×8 的 is_pr 应该是 `1, 0, 0`（仅第 1 组算 PR，因为同重量多组不重复计数）。
+
+---
+
+## Bug #2（中优先级）：肌群冲突检测的 SQL/逻辑边界
+
+**位置**：`backend/src/services/mod.rs` 的 `CalendarService::check_muscle_conflict`
+
+**问题**：当数据库里完全没有任何 workout_sessions 时（首次访问场景），调用 `/api/stats/muscle-conflict?muscles=胸部&date=2026-06-09` 返回：
+```
+[{"muscle":"胸部","last_train_date":"2026-06-05","days_since":999,"conflict":false}]
+```
+
+`last_train_date: "2026-06-05"` 是错误的——这是 `three_days_ago` 的日期字符串（被错误地绑定到了 `MAX(ws.session_date)`）。SQL `MAX()` 在空表上应该返回 NULL，但实际返回了 `target_date - 3 days` 的字符串。
+
+**根因**：SQL placeholder 绑定顺序可能有问题（参数 1 同时绑给 `julianday(?)` 和 `MAX(ws.session_date)` 的位置？），或者 SQL aggregate 在空集上有非预期行为。
+
+**期望效果**：空表情况下，函数应该返回 `[]` 或者 `[{muscle:"胸部", last_train_date:null, days_since:null, conflict:false}]`，不应该返回假的 last_train_date。
+
+---
+
+## 验证步骤（修复后跑）
+
+1. `cd backend && cargo build`
+2. `rm -f fitness.db && cargo run --bin seed -- ../seed/exercises.csv`
+3. `cargo run --bin solid-fitness-backend` （启动后端）
+4. 重新跑 3 组同重量同次数的 PR 测试，验证 is_pr 正确（仅第 1 组是 1，其余是 0）
+5. 空表情况下调用 muscle-conflict，验证不返回假的 last_train_date
+6. 跑前端 dev server (`cd frontend && npm run dev`)，验证 6 个页面都能正常加载且无 console error
+
+## 备注不被卡住的部分
+
+- 后端编译 1m 20s 通过（有 3 个 dead_code 警告，不是 bug）
+- 前端 vite dev server 正常启动在 :3000
+- 47 个 exercises 通过 seed 导入成功
+- 视频 iframe 用了 `loading="lazy"`（PROMPT 要求 ✅）
+- 训练日历/计划/记录/体测 4 个核心模块前端均正常渲染
+- 容量计算正确（3×60×8 + 50×12 = 2040）
+- 肌群冲突的核心逻辑正确（同肌群 3 天内训练返回 conflict=true）
+- 训练计划 freeze/activate 端点工作正常
